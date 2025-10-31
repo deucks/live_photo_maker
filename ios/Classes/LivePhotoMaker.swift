@@ -10,6 +10,7 @@ import UIKit
 import AVFoundation
 import MobileCoreServices
 import Photos
+import AudioToolbox
 
 class LivePhotoMaker {
     // MARK: PUBLIC
@@ -194,6 +195,7 @@ class LivePhotoMaker {
         
         var audioWriterInput: AVAssetWriterInput?
         var audioReaderOutput: AVAssetReaderOutput?
+        var silentAudioConfiguration: (input: AVAssetWriterInput, sampleRate: Double, channels: Int)?
         let videoAsset = AVURLAsset(url: videoURL)
         let frameCount = videoAsset.countFrames(exact: false)
         guard let videoTrack = videoAsset.tracks(withMediaType: .video).first else {
@@ -223,10 +225,31 @@ class LivePhotoMaker {
                     audioReaderOutput = _audioReaderOutput
                     let _audioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
                     _audioWriterInput.expectsMediaDataInRealTime = false
-                    assetWriter?.add(_audioWriterInput)
-                    audioWriterInput = _audioWriterInput
+                    if assetWriter?.canAdd(_audioWriterInput) ?? false {
+                        assetWriter?.add(_audioWriterInput)
+                        audioWriterInput = _audioWriterInput
+                    }
                 } catch {
                     print(error)
+                }
+            } else {
+                let sampleRate: Double = 44100
+                let channels = 1
+                let silentAudioSettings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: sampleRate,
+                    AVNumberOfChannelsKey: channels,
+                    AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsFloatKey: false,
+                    AVLinearPCMIsNonInterleavedKey: false
+                ]
+                let silentInput = AVAssetWriterInput(mediaType: .audio, outputSettings: silentAudioSettings)
+                silentInput.expectsMediaDataInRealTime = false
+                if assetWriter?.canAdd(silentInput) ?? false {
+                    assetWriter?.add(silentInput)
+                    audioWriterInput = silentInput
+                    silentAudioConfiguration = (silentInput, sampleRate, channels)
                 }
             }
             // Create necessary identifier metadata and still image time metadata
@@ -242,7 +265,8 @@ class LivePhotoMaker {
             stillImageTimeMetadataAdapter.append(AVTimedMetadataGroup(items: [metadataItemForStillImageTime()],timeRange: videoAsset.makeStillImageTimeRange(percent: _stillImagePercent, inFrameCount: frameCount)))
             // For end of writing / progress
             var writingVideoFinished = false
-            var writingAudioFinished = false
+            let pendingAudio = audioWriterInput != nil
+            var writingAudioFinished = !pendingAudio
             var currentFrameCount = 0
             func didCompleteWriting() {
                 guard writingAudioFinished && writingVideoFinished else { return }
@@ -278,16 +302,62 @@ class LivePhotoMaker {
                 didCompleteWriting()
             }
             // Start writing audio
-            if audioReader?.startReading() ?? false {
-                audioWriterInput?.requestMediaDataWhenReady(on: DispatchQueue(label: "audioWriterInputQueue")) {
-                    while audioWriterInput?.isReadyForMoreMediaData ?? false {
-                        guard let sampleBuffer = audioReaderOutput?.copyNextSampleBuffer() else {
-                            audioWriterInput?.markAsFinished()
+            if let reader = audioReader,
+               let audioWriterInput = audioWriterInput,
+               let readerOutput = audioReaderOutput {
+                if reader.startReading() {
+                    audioWriterInput.requestMediaDataWhenReady(on: DispatchQueue(label: "audioWriterInputQueue")) {
+                        while audioWriterInput.isReadyForMoreMediaData {
+                            guard let sampleBuffer = readerOutput.copyNextSampleBuffer() else {
+                                audioWriterInput.markAsFinished()
+                                writingAudioFinished = true
+                                didCompleteWriting()
+                                return
+                            }
+                            audioWriterInput.append(sampleBuffer)
+                        }
+                    }
+                } else {
+                    writingAudioFinished = true
+                    didCompleteWriting()
+                }
+            } else if let silentConfig = silentAudioConfiguration {
+                let sampleRate = silentConfig.sampleRate
+                let totalSamples = Int64(round(videoAsset.duration.seconds * sampleRate))
+                if totalSamples == 0 {
+                    silentConfig.input.markAsFinished()
+                    writingAudioFinished = true
+                    didCompleteWriting()
+                } else {
+                    let audioQueue = DispatchQueue(label: "audioWriterInputQueue")
+                    var currentSample: Int64 = 0
+                    silentConfig.input.requestMediaDataWhenReady(on: audioQueue) {
+                        while silentConfig.input.isReadyForMoreMediaData && currentSample < totalSamples {
+                            let samplesThisTime = min(1024, Int(totalSamples - currentSample))
+                            let presentationTime = CMTime(value: currentSample, timescale: CMTimeScale(sampleRate))
+                            guard let buffer = self.createSilentAudioSampleBuffer(sampleCount: samplesThisTime,
+                                                                                   sampleRate: sampleRate,
+                                                                                   channels: silentConfig.channels,
+                                                                                   presentationTime: presentationTime) else {
+                                silentConfig.input.markAsFinished()
+                                writingAudioFinished = true
+                                didCompleteWriting()
+                                return
+                            }
+                            if silentConfig.input.append(buffer) {
+                                currentSample += Int64(samplesThisTime)
+                            } else {
+                                silentConfig.input.markAsFinished()
+                                writingAudioFinished = true
+                                didCompleteWriting()
+                                return
+                            }
+                        }
+                        if currentSample >= totalSamples {
+                            silentConfig.input.markAsFinished()
                             writingAudioFinished = true
                             didCompleteWriting()
-                            return
                         }
-                        audioWriterInput?.append(sampleBuffer)
                     }
                 }
             } else {
@@ -298,6 +368,84 @@ class LivePhotoMaker {
             print(error)
             completion(nil)
         }
+    }
+
+    private func createSilentAudioSampleBuffer(sampleCount: Int, sampleRate: Double, channels: Int, presentationTime: CMTime) -> CMSampleBuffer? {
+        guard sampleCount > 0 else { return nil }
+
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(channels * MemoryLayout<Int16>.size),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(channels * MemoryLayout<Int16>.size),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: UInt32(MemoryLayout<Int16>.size * 8),
+            mReserved: 0)
+
+        var formatDescription: CMAudioFormatDescription?
+        let formatStatus = CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault,
+                                                          asbd: &asbd,
+                                                          layoutSize: 0,
+                                                          layout: nil,
+                                                          magicCookieSize: 0,
+                                                          magicCookie: nil,
+                                                          extensions: nil,
+                                                          formatDescriptionOut: &formatDescription)
+        guard formatStatus == noErr, let audioFormatDescription = formatDescription else {
+            return nil
+        }
+
+        let bytesPerFrame = Int(asbd.mBytesPerFrame)
+        let bufferLength = sampleCount * bytesPerFrame
+
+        var blockBuffer: CMBlockBuffer?
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
+                                                             memoryBlock: nil,
+                                                             blockLength: bufferLength,
+                                                             blockAllocator: nil,
+                                                             customBlockSource: nil,
+                                                             offsetToData: 0,
+                                                             dataLength: bufferLength,
+                                                             flags: 0,
+                                                             blockBufferOut: &blockBuffer)
+        guard blockStatus == kCMBlockBufferNoErr, let audioBlockBuffer = blockBuffer else {
+            return nil
+        }
+
+        let zeroBytes = [UInt8](repeating: 0, count: bufferLength)
+        zeroBytes.withUnsafeBytes { pointer in
+            if let baseAddress = pointer.baseAddress {
+                CMBlockBufferReplaceDataBytes(with: baseAddress,
+                                              blockBuffer: audioBlockBuffer,
+                                              offsetIntoDestination: 0,
+                                              dataLength: bufferLength)
+            }
+        }
+
+        var timing = CMSampleTimingInfo(duration: CMTime(value: CMTimeValue(sampleCount), timescale: CMTimeScale(sampleRate)),
+                                        presentationTimeStamp: presentationTime,
+                                        decodeTimeStamp: presentationTime)
+
+        var sampleBuffer: CMSampleBuffer?
+        let sampleStatus = CMSampleBufferCreate(allocator: kCFAllocatorDefault,
+                                                dataBuffer: audioBlockBuffer,
+                                                dataReady: true,
+                                                makeDataReadyCallback: nil,
+                                                refcon: nil,
+                                                formatDescription: audioFormatDescription,
+                                                sampleCount: sampleCount,
+                                                sampleTimingEntryCount: 1,
+                                                sampleTimingArray: &timing,
+                                                sampleSizeEntryCount: 0,
+                                                sampleSizeArray: nil,
+                                                sampleBufferOut: &sampleBuffer)
+        guard sampleStatus == noErr, let buffer = sampleBuffer else {
+            return nil
+        }
+
+        return buffer
     }
     
     private func metadataForAssetID(_ assetIdentifier: String) -> [AVMetadataItem] {
@@ -325,6 +473,28 @@ class LivePhotoMaker {
         items.append(makeStringItem(key: "com.apple.quicktime.content.identifier",
                                      dataType: "com.apple.metadata.datatype.UTF-8",
                                      value: assetIdentifier))
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.dateFormat = "yyyy:MM:dd HH:mm:ssXXXXX"
+        let formattedDate = dateFormatter.string(from: Date())
+
+        items.append(makeStringItem(key: "com.apple.quicktime.creationdate",
+                                     dataType: "com.apple.metadata.datatype.UTF-8",
+                                     value: formattedDate))
+
+        let device = UIDevice.current
+        items.append(makeStringItem(key: "com.apple.quicktime.make",
+                                     dataType: "com.apple.metadata.datatype.UTF-8",
+                                     value: "Apple"))
+
+        items.append(makeStringItem(key: "com.apple.quicktime.model",
+                                     dataType: "com.apple.metadata.datatype.UTF-8",
+                                     value: device.model))
+
+        items.append(makeStringItem(key: "com.apple.quicktime.software",
+                                     dataType: "com.apple.metadata.datatype.UTF-8",
+                                     value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
 
         items.append(makeNumericItem(key: "com.apple.quicktime.live-photo.auto",
                                      dataType: "com.apple.metadata.datatype.int8",
