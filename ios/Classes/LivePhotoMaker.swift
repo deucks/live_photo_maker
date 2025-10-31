@@ -232,7 +232,7 @@ class LivePhotoMaker {
             // Create necessary identifier metadata and still image time metadata
             let assetIdentifierMetadata = metadataForAssetID(assetIdentifier)
             let stillImageTimeMetadataAdapter = createMetadataAdaptorForStillImageTime()
-            assetWriter?.metadata = [assetIdentifierMetadata]
+            assetWriter?.metadata = assetIdentifierMetadata
             assetWriter?.add(stillImageTimeMetadataAdapter.assetWriterInput)
             // Start the Asset Writer
             assetWriter?.startWriting()
@@ -300,15 +300,49 @@ class LivePhotoMaker {
         }
     }
     
-    private func metadataForAssetID(_ assetIdentifier: String) -> AVMetadataItem {
-        let item = AVMutableMetadataItem()
-        let keyContentIdentifier =  "com.apple.quicktime.content.identifier"
-        let keySpaceQuickTimeMetadata = "mdta"
-        item.key = keyContentIdentifier as (NSCopying & NSObjectProtocol)?
-        item.keySpace = AVMetadataKeySpace(rawValue: keySpaceQuickTimeMetadata)
-        item.value = assetIdentifier as (NSCopying & NSObjectProtocol)?
-        item.dataType = "com.apple.metadata.datatype.UTF-8"
-        return item
+    private func metadataForAssetID(_ assetIdentifier: String) -> [AVMetadataItem] {
+        var items: [AVMetadataItem] = []
+        let keySpaceQuickTimeMetadata = AVMetadataKeySpace.quickTimeMetadata
+
+        func makeStringItem(key: String, dataType: String, value: String) -> AVMetadataItem {
+            let item = AVMutableMetadataItem()
+            item.key = key as (NSCopying & NSObjectProtocol)?
+            item.keySpace = keySpaceQuickTimeMetadata
+            item.value = value as (NSCopying & NSObjectProtocol)?
+            item.dataType = dataType
+            return item
+        }
+
+        func makeNumericItem(key: String, dataType: String, value: NSNumber) -> AVMetadataItem {
+            let item = AVMutableMetadataItem()
+            item.key = key as (NSCopying & NSObjectProtocol)?
+            item.keySpace = keySpaceQuickTimeMetadata
+            item.value = value
+            item.dataType = dataType
+            return item
+        }
+
+        items.append(makeStringItem(key: "com.apple.quicktime.content.identifier",
+                                     dataType: "com.apple.metadata.datatype.UTF-8",
+                                     value: assetIdentifier))
+
+        items.append(makeNumericItem(key: "com.apple.quicktime.live-photo.auto",
+                                     dataType: "com.apple.metadata.datatype.int8",
+                                     value: NSNumber(value: Int8(1))))
+
+        items.append(makeNumericItem(key: "com.apple.quicktime.live-photo.full-framerate-playback-intent",
+                                     dataType: "com.apple.metadata.datatype.int8",
+                                     value: NSNumber(value: Int8(1))))
+
+        items.append(makeNumericItem(key: "com.apple.quicktime.live-photo.vitality-score",
+                                     dataType: "com.apple.metadata.datatype.float32",
+                                     value: NSNumber(value: Float(1.0))))
+
+        items.append(makeNumericItem(key: "com.apple.quicktime.live-photo.vitality-score-version",
+                                     dataType: "com.apple.metadata.datatype.int8",
+                                     value: NSNumber(value: Int8(4))))
+
+        return items
     }
     
     private func createMetadataAdaptorForStillImageTime() -> AVAssetWriterInputMetadataAdaptor {
