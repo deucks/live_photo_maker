@@ -1,120 +1,110 @@
-//
-//  LivePhotoMaker.swift
-//  Live Photos
-//
-//  Created by Alexander Pagliaro on 7/25/18.
-//  Copyright © 2018 Limit Point LLC. All rights reserved.
-//
-
 import UIKit
 import AVFoundation
 import MobileCoreServices
 import Photos
-import AudioToolbox
 
 class LivePhotoMaker {
-    // MARK: PUBLIC
     typealias LivePhotoResources = (pairedImage: URL, pairedVideo: URL)
-    /// Returns the paired image and video for the given PHLivePhoto
+
+    private static let shared = LivePhotoMaker()
+    private static let queue = DispatchQueue(label: "com.limit-point.LivePhotoQueue", attributes: .concurrent)
+
+    private lazy var cacheDirectory: URL? = {
+        guard let cacheDirectoryURL = try? FileManager.default.url(for: .cachesDirectory,
+                                                                   in: .userDomainMask,
+                                                                   appropriateFor: nil,
+                                                                   create: false) else { return nil }
+        let fullDirectory = cacheDirectoryURL.appendingPathComponent("com.limit-point.LivePhoto", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: fullDirectory.path) {
+            try? FileManager.default.createDirectory(at: fullDirectory, withIntermediateDirectories: true, attributes: nil)
+        }
+        return fullDirectory
+    }()
+
+    private lazy var metadataTemplateURL: URL? = {
+        Bundle(for: LivePhotoMaker.self).url(forResource: "metadata", withExtension: "mov")
+    }()
+
+    deinit {
+        if let cacheDirectory = cacheDirectory {
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+    }
+
+    // MARK: - Public API
+
     public class func extractResources(from livePhoto: PHLivePhoto, completion: @escaping (LivePhotoResources?) -> Void) {
         queue.async {
             shared.extractResources(from: livePhoto, completion: completion)
         }
     }
-    /// Generates a PHLivePhoto from an image and video.  Also returns the paired image and video.
-    public class func generate(from imageURL: URL?, videoURL: URL, progress: @escaping (CGFloat) -> Void, completion: @escaping (PHLivePhoto?, LivePhotoResources?) -> Void) {
+
+    public class func generate(from imageURL: URL?,
+                               videoURL: URL,
+                               progress: @escaping (CGFloat) -> Void,
+                               completion: @escaping (PHLivePhoto?, LivePhotoResources?) -> Void) {
         queue.async {
             shared.generate(from: imageURL, videoURL: videoURL, progress: progress, completion: completion)
         }
     }
-    /// Save a Live Photo to the Photo Library by passing the paired image and video.
+
     public class func saveToLibrary(_ resources: LivePhotoResources, completion: @escaping (Bool) -> Void) {
         PHPhotoLibrary.shared().performChanges({
             let creationRequest = PHAssetCreationRequest.forAsset()
             let options = PHAssetResourceCreationOptions()
-            creationRequest.addResource(with: PHAssetResourceType.pairedVideo, fileURL: resources.pairedVideo, options: options)
-            creationRequest.addResource(with: PHAssetResourceType.photo, fileURL: resources.pairedImage, options: options)
-        }, completionHandler: { (success, error) in
-            if error != nil {
-                print(error as Any)
+            creationRequest.addResource(with: .pairedVideo, fileURL: resources.pairedVideo, options: options)
+            creationRequest.addResource(with: .photo, fileURL: resources.pairedImage, options: options)
+        }, completionHandler: { success, error in
+            if let error = error {
+                print("LivePhoto save error: \(error)")
             }
             completion(success)
         })
     }
-    
-    // MARK: PRIVATE
-    private static let shared = LivePhotoMaker()
-    private static let queue = DispatchQueue(label: "com.limit-point.LivePhotoQueue", attributes: .concurrent)
-    lazy private var cacheDirectory: URL? = {
-        if let cacheDirectoryURL = try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
-            let fullDirectory = cacheDirectoryURL.appendingPathComponent("com.limit-point.LivePhoto", isDirectory: true)
-            if !FileManager.default.fileExists(atPath: fullDirectory.absoluteString) {
-                try? FileManager.default.createDirectory(at: fullDirectory, withIntermediateDirectories: true, attributes: nil)
-            }
-            return fullDirectory
-        }
-        return nil
-    }()
-    
-    deinit {
-        clearCache()
-    }
-    
-    private func generateKeyPhoto(from videoURL: URL) -> URL? {
-        var percent:Float = 0.5
-        let videoAsset = AVURLAsset(url: videoURL)
-        if let stillImageTime = videoAsset.stillImageTime() {
-            percent = Float(stillImageTime.value) / Float(videoAsset.duration.value)
-        }
-        guard let imageFrame = videoAsset.getAssetFrame(percent: percent) else { return nil }
-        guard let jpegData = imageFrame.jpegData(compressionQuality: 1.0) else { return nil }
-        guard let url = cacheDirectory?.appendingPathComponent(UUID().uuidString).appendingPathExtension("jpg") else { return nil }
-        do {
-            try? jpegData.write(to: url)
-            return url
-        }
-    }
-    private func clearCache() {
-        if let cacheDirectory = cacheDirectory {
-            try? FileManager.default.removeItem(at: cacheDirectory)
-        }
-    }
-    
-    private func generate(from imageURL: URL?, videoURL: URL, progress: @escaping (CGFloat) -> Void, completion: @escaping (PHLivePhoto?, LivePhotoResources?) -> Void) {
-        guard let cacheDirectory = cacheDirectory else {
-            DispatchQueue.main.async {
-                completion(nil, nil)
-            }
+
+    // MARK: - Generation
+
+    private func generate(from imageURL: URL?,
+                          videoURL: URL,
+                          progress: @escaping (CGFloat) -> Void,
+                          completion: @escaping (PHLivePhoto?, LivePhotoResources?) -> Void) {
+        guard let cacheDirectory = cacheDirectory, let metadataURL = metadataTemplateURL else {
+            DispatchQueue.main.async { completion(nil, nil) }
             return
         }
-        let assetIdentifier = UUID().uuidString
-        let _keyPhotoURL = imageURL ?? generateKeyPhoto(from: videoURL)
-        guard let keyPhotoURL = _keyPhotoURL, let pairedImageURL = addAssetID(assetIdentifier, toImage: keyPhotoURL, saveTo: cacheDirectory.appendingPathComponent(assetIdentifier).appendingPathExtension("heic")) else {
-            DispatchQueue.main.async {
-                completion(nil, nil)
+
+        DispatchQueue.main.async { progress(0.0) }
+
+        let pipeline = Video2LivePhotoPipeline(metadataURL: metadataURL)
+        pipeline.process(videoURL: videoURL, cacheDirectory: cacheDirectory, customImageURL: imageURL) { output in
+            guard let output = output else {
+                DispatchQueue.main.async { completion(nil, nil) }
+                return
             }
-            return
-        }
-        addAssetID(assetIdentifier, toVideo: videoURL, saveTo: cacheDirectory.appendingPathComponent(assetIdentifier).appendingPathExtension("mov"), progress: progress) { (_videoURL) in
-            if let pairedVideoURL = _videoURL {
-                _ = PHLivePhoto.request(withResourceFileURLs: [pairedVideoURL, pairedImageURL], placeholderImage: nil, targetSize: CGSize.zero, contentMode: .aspectFit, resultHandler: { (livePhoto: PHLivePhoto?, info: [AnyHashable: Any]) -> Void in
-                    if let isDegraded = info[PHLivePhotoInfoIsDegradedKey] as? Bool, isDegraded {
-                        return
-                    }
-                    DispatchQueue.main.async {
-                        completion(livePhoto, (pairedImageURL, pairedVideoURL))
-                    }
-                })
-            } else {
+
+            let resources: LivePhotoResources = (pairedImage: output.keyPhotoURL, pairedVideo: output.pairedVideoURL)
+            let resourceURLs: [URL] = [output.pairedVideoURL, output.keyPhotoURL]
+
+            PHLivePhoto.request(withResourceFileURLs: resourceURLs,
+                                placeholderImage: nil,
+                                targetSize: .zero,
+                                contentMode: .aspectFit) { livePhoto, info in
+                if let isDegraded = info[PHLivePhotoInfoIsDegradedKey] as? Bool, isDegraded {
+                    return
+                }
                 DispatchQueue.main.async {
-                    completion(nil, nil)
+                    progress(1.0)
+                    completion(livePhoto, resources)
                 }
             }
         }
     }
 
-    
-    private func extractResources(from livePhoto: PHLivePhoto, to directoryURL: URL, completion: @escaping (LivePhotoResources?) -> Void) {
+    // MARK: - Extraction
+
+    private func extractResources(from livePhoto: PHLivePhoto,
+                                  to directoryURL: URL,
+                                  completion: @escaping (LivePhotoResources?) -> Void) {
         let assetResources = PHAssetResource.assetResources(for: livePhoto)
         let group = DispatchGroup()
         var keyPhotoURL: URL?
@@ -124,9 +114,9 @@ class LivePhotoMaker {
             let options = PHAssetResourceRequestOptions()
             options.isNetworkAccessAllowed = true
             group.enter()
-            PHAssetResourceManager.default().requestData(for: resource, options: options, dataReceivedHandler: { (data) in
+            PHAssetResourceManager.default().requestData(for: resource, options: options, dataReceivedHandler: { data in
                 buffer.append(data)
-            }) { (error) in
+            }) { error in
                 if error == nil {
                     if resource.type == .pairedVideo {
                         videoURL = self.saveAssetResource(resource, to: directoryURL, resourceData: buffer as Data)
@@ -134,7 +124,7 @@ class LivePhotoMaker {
                         keyPhotoURL = self.saveAssetResource(resource, to: directoryURL, resourceData: buffer as Data)
                     }
                 } else {
-                    print(error as Any)
+                    print("Extract resource error: \(String(describing: error))")
                 }
                 group.leave()
             }
@@ -147,532 +137,34 @@ class LivePhotoMaker {
             completion((pairedPhotoURL, pairedVideoURL))
         }
     }
-    
+
     private func extractResources(from livePhoto: PHLivePhoto, completion: @escaping (LivePhotoResources?) -> Void) {
         if let cacheDirectory = cacheDirectory {
             extractResources(from: livePhoto, to: cacheDirectory, completion: completion)
+        } else {
+            completion(nil)
         }
     }
-    
-    private func saveAssetResource(_ resource: PHAssetResource, to directory: URL, resourceData: Data) -> URL? {
-        let fileExtension = UTTypeCopyPreferredTagWithClass(resource.uniformTypeIdentifier as CFString,kUTTagClassFilenameExtension)?.takeRetainedValue()
-        
+
+    private func saveAssetResource(_ resource: PHAssetResource,
+                                   to directory: URL,
+                                   resourceData: Data) -> URL? {
+        let fileExtension = UTTypeCopyPreferredTagWithClass(resource.uniformTypeIdentifier as CFString,
+                                                           kUTTagClassFilenameExtension)?.takeRetainedValue()
         guard let ext = fileExtension else {
             return nil
         }
-        
-        var fileUrl = directory.appendingPathComponent(NSUUID().uuidString)
-        fileUrl = fileUrl.appendingPathExtension(ext as String)
-        
+
+        var fileURL = directory.appendingPathComponent(UUID().uuidString)
+        fileURL.appendPathExtension(ext as String)
+
         do {
-            try resourceData.write(to: fileUrl, options: [Data.WritingOptions.atomic])
+            try resourceData.write(to: fileURL, options: .atomic)
         } catch {
-            print("Could not save resource \(resource) to filepath \(String(describing: fileUrl))")
+            print("Could not save resource \(resource) to \(fileURL): \(error)")
             return nil
         }
-        
-        return fileUrl
+        return fileURL
     }
-    
-    func addAssetID(_ assetIdentifier: String, toImage imageURL: URL, saveTo destinationURL: URL) -> URL? {
-        guard let imageDestination = CGImageDestinationCreateWithURL(destinationURL as CFURL, kUTTypeJPEG, 1, nil),
-              let imageSource = CGImageSourceCreateWithURL(imageURL as CFURL, nil),
-              let imageRef = CGImageSourceCreateImageAtIndex(imageSource, 0, nil), 
-                var imageProperties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [AnyHashable : Any] else { return nil }
-        let assetIdentifierKey = "17"
-        let assetIdentifierInfo = [assetIdentifierKey : assetIdentifier]
-        imageProperties[kCGImagePropertyMakerAppleDictionary] = assetIdentifierInfo
-        CGImageDestinationAddImage(imageDestination, imageRef, imageProperties as CFDictionary)
-        CGImageDestinationFinalize(imageDestination)
-        return destinationURL
-    }
-    
-    var audioReader: AVAssetReader?
-    var videoReader: AVAssetReader?
-    var assetWriter: AVAssetWriter?
-    
-    func addAssetID(_ assetIdentifier: String, toVideo videoURL: URL, saveTo destinationURL: URL, progress: @escaping (CGFloat) -> Void, completion: @escaping (URL?) -> Void) {
-        
-        var audioWriterInput: AVAssetWriterInput?
-        var audioReaderOutput: AVAssetReaderOutput?
-        var silentAudioConfiguration: (input: AVAssetWriterInput, sampleRate: Double, channels: Int)?
-        let videoAsset = AVURLAsset(url: videoURL)
-        let frameCount = videoAsset.countFrames(exact: false)
-        guard let videoTrack = videoAsset.tracks(withMediaType: .video).first else {
-            completion(nil)
-            return
-        }
-        do {
-            // Create the Asset Writer
-            assetWriter = try AVAssetWriter(outputURL: destinationURL, fileType: .mov)
-            // Create Video Reader Output
-            videoReader = try AVAssetReader(asset: videoAsset)
-            let videoReaderSettings = [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA as UInt32)]
-            let videoReaderOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: videoReaderSettings)
-            videoReader?.add(videoReaderOutput)
-            // Create Video Writer Input
-            let videoWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey : AVVideoCodecH264, AVVideoWidthKey : videoTrack.naturalSize.width, AVVideoHeightKey : videoTrack.naturalSize.height])
-            videoWriterInput.transform = videoTrack.preferredTransform
-            videoWriterInput.expectsMediaDataInRealTime = true
-            assetWriter?.add(videoWriterInput)
-            // Create Audio Reader Output & Writer Input
-            if let audioTrack = videoAsset.tracks(withMediaType: .audio).first {
-                do {
-                    let _audioReader = try AVAssetReader(asset: videoAsset)
-                    let _audioReaderOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-                    _audioReader.add(_audioReaderOutput)
-                    audioReader = _audioReader
-                    audioReaderOutput = _audioReaderOutput
-                    let _audioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
-                    _audioWriterInput.expectsMediaDataInRealTime = false
-                    if assetWriter?.canAdd(_audioWriterInput) ?? false {
-                        assetWriter?.add(_audioWriterInput)
-                        audioWriterInput = _audioWriterInput
-                    }
-                } catch {
-                    print(error)
-                }
-            } else {
-                let sampleRate: Double = 44100
-                let channels = 1
-                let silentAudioSettings: [String: Any] = [
-                    AVFormatIDKey: kAudioFormatLinearPCM,
-                    AVSampleRateKey: sampleRate,
-                    AVNumberOfChannelsKey: channels,
-                    AVLinearPCMBitDepthKey: 16,
-                    AVLinearPCMIsBigEndianKey: false,
-                    AVLinearPCMIsFloatKey: false,
-                    AVLinearPCMIsNonInterleavedKey: false
-                ]
-                let silentInput = AVAssetWriterInput(mediaType: .audio, outputSettings: silentAudioSettings)
-                silentInput.expectsMediaDataInRealTime = false
-                if assetWriter?.canAdd(silentInput) ?? false {
-                    assetWriter?.add(silentInput)
-                    audioWriterInput = silentInput
-                    silentAudioConfiguration = (silentInput, sampleRate, channels)
-                }
-            }
-            // Create necessary identifier metadata and still image time metadata
-            let assetIdentifierMetadata = metadataForAssetID(assetIdentifier)
-            let stillImageTimeMetadataAdapter = createMetadataAdaptorForStillImageTime()
-            assetWriter?.metadata = assetIdentifierMetadata
-            assetWriter?.add(stillImageTimeMetadataAdapter.assetWriterInput)
-            // Start the Asset Writer
-            assetWriter?.startWriting()
-            assetWriter?.startSession(atSourceTime: CMTime.zero)
-            // Add still image metadata
-            let _stillImagePercent: Float = 0.5
-            stillImageTimeMetadataAdapter.append(AVTimedMetadataGroup(items: [metadataItemForStillImageTime()],timeRange: videoAsset.makeStillImageTimeRange(percent: _stillImagePercent, inFrameCount: frameCount)))
-            // For end of writing / progress
-            var writingVideoFinished = false
-            let pendingAudio = audioWriterInput != nil
-            var writingAudioFinished = !pendingAudio
-            var currentFrameCount = 0
-            func didCompleteWriting() {
-                guard writingAudioFinished && writingVideoFinished else { return }
-                assetWriter?.finishWriting {
-                    if self.assetWriter?.status == .completed {
-                        completion(destinationURL)
-                    } else {
-                        completion(nil)
-                    }
-                }
-            }
-            // Start writing video
-            if videoReader?.startReading() ?? false {
-                videoWriterInput.requestMediaDataWhenReady(on: DispatchQueue(label: "videoWriterInputQueue")) {
-                    while videoWriterInput.isReadyForMoreMediaData {
-                        if let sampleBuffer = videoReaderOutput.copyNextSampleBuffer()  {
-                            currentFrameCount += 1
-                            let percent:CGFloat = CGFloat(currentFrameCount)/CGFloat(frameCount)
-                            progress(percent)
-                            if !videoWriterInput.append(sampleBuffer) {
-                                print("Cannot write: \(String(describing: self.assetWriter?.error?.localizedDescription))")
-                                self.videoReader?.cancelReading()
-                            }
-                        } else {
-                            videoWriterInput.markAsFinished()
-                            writingVideoFinished = true
-                            didCompleteWriting()
-                        }
-                    }
-                }
-            } else {
-                writingVideoFinished = true
-                didCompleteWriting()
-            }
-            // Start writing audio
-            if let reader = audioReader,
-               let audioWriterInput = audioWriterInput,
-               let readerOutput = audioReaderOutput {
-                if reader.startReading() {
-                    audioWriterInput.requestMediaDataWhenReady(on: DispatchQueue(label: "audioWriterInputQueue")) {
-                        while audioWriterInput.isReadyForMoreMediaData {
-                            guard let sampleBuffer = readerOutput.copyNextSampleBuffer() else {
-                                audioWriterInput.markAsFinished()
-                                writingAudioFinished = true
-                                didCompleteWriting()
-                                return
-                            }
-                            audioWriterInput.append(sampleBuffer)
-                        }
-                    }
-                } else {
-                    writingAudioFinished = true
-                    didCompleteWriting()
-                }
-            } else if let silentConfig = silentAudioConfiguration {
-                let sampleRate = silentConfig.sampleRate
-                let totalSamples = Int64(round(videoAsset.duration.seconds * sampleRate))
-                if totalSamples == 0 {
-                    silentConfig.input.markAsFinished()
-                    writingAudioFinished = true
-                    didCompleteWriting()
-                } else {
-                    let audioQueue = DispatchQueue(label: "audioWriterInputQueue")
-                    var currentSample: Int64 = 0
-                    silentConfig.input.requestMediaDataWhenReady(on: audioQueue) {
-                        while silentConfig.input.isReadyForMoreMediaData && currentSample < totalSamples {
-                            let samplesThisTime = min(1024, Int(totalSamples - currentSample))
-                            let presentationTime = CMTime(value: currentSample, timescale: CMTimeScale(sampleRate))
-                            guard let buffer = self.createSilentAudioSampleBuffer(sampleCount: samplesThisTime,
-                                                                                   sampleRate: sampleRate,
-                                                                                   channels: silentConfig.channels,
-                                                                                   presentationTime: presentationTime) else {
-                                silentConfig.input.markAsFinished()
-                                writingAudioFinished = true
-                                didCompleteWriting()
-                                return
-                            }
-                            if silentConfig.input.append(buffer) {
-                                currentSample += Int64(samplesThisTime)
-                            } else {
-                                silentConfig.input.markAsFinished()
-                                writingAudioFinished = true
-                                didCompleteWriting()
-                                return
-                            }
-                        }
-                        if currentSample >= totalSamples {
-                            silentConfig.input.markAsFinished()
-                            writingAudioFinished = true
-                            didCompleteWriting()
-                        }
-                    }
-                }
-            } else {
-                writingAudioFinished = true
-                didCompleteWriting()
-            }
-        } catch {
-            print(error)
-            completion(nil)
-        }
-    }
-
-    private func createSilentAudioSampleBuffer(sampleCount: Int, sampleRate: Double, channels: Int, presentationTime: CMTime) -> CMSampleBuffer? {
-        guard sampleCount > 0 else { return nil }
-
-        var asbd = AudioStreamBasicDescription(
-            mSampleRate: sampleRate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: UInt32(channels * MemoryLayout<Int16>.size),
-            mFramesPerPacket: 1,
-            mBytesPerFrame: UInt32(channels * MemoryLayout<Int16>.size),
-            mChannelsPerFrame: UInt32(channels),
-            mBitsPerChannel: UInt32(MemoryLayout<Int16>.size * 8),
-            mReserved: 0)
-
-        var formatDescription: CMAudioFormatDescription?
-        let formatStatus = CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault,
-                                                          asbd: &asbd,
-                                                          layoutSize: 0,
-                                                          layout: nil,
-                                                          magicCookieSize: 0,
-                                                          magicCookie: nil,
-                                                          extensions: nil,
-                                                          formatDescriptionOut: &formatDescription)
-        guard formatStatus == noErr, let audioFormatDescription = formatDescription else {
-            return nil
-        }
-
-        let bytesPerFrame = Int(asbd.mBytesPerFrame)
-        let bufferLength = sampleCount * bytesPerFrame
-
-        var blockBuffer: CMBlockBuffer?
-        let blockStatus = CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
-                                                             memoryBlock: nil,
-                                                             blockLength: bufferLength,
-                                                             blockAllocator: nil,
-                                                             customBlockSource: nil,
-                                                             offsetToData: 0,
-                                                             dataLength: bufferLength,
-                                                             flags: 0,
-                                                             blockBufferOut: &blockBuffer)
-        guard blockStatus == kCMBlockBufferNoErr, let audioBlockBuffer = blockBuffer else {
-            return nil
-        }
-
-        let zeroBytes = [UInt8](repeating: 0, count: bufferLength)
-        zeroBytes.withUnsafeBytes { pointer in
-            if let baseAddress = pointer.baseAddress {
-                CMBlockBufferReplaceDataBytes(with: baseAddress,
-                                              blockBuffer: audioBlockBuffer,
-                                              offsetIntoDestination: 0,
-                                              dataLength: bufferLength)
-            }
-        }
-
-        var timing = CMSampleTimingInfo(duration: CMTime(value: CMTimeValue(sampleCount), timescale: CMTimeScale(sampleRate)),
-                                        presentationTimeStamp: presentationTime,
-                                        decodeTimeStamp: presentationTime)
-
-        var sampleBuffer: CMSampleBuffer?
-        let sampleStatus = CMSampleBufferCreate(allocator: kCFAllocatorDefault,
-                                                dataBuffer: audioBlockBuffer,
-                                                dataReady: true,
-                                                makeDataReadyCallback: nil,
-                                                refcon: nil,
-                                                formatDescription: audioFormatDescription,
-                                                sampleCount: sampleCount,
-                                                sampleTimingEntryCount: 1,
-                                                sampleTimingArray: &timing,
-                                                sampleSizeEntryCount: 0,
-                                                sampleSizeArray: nil,
-                                                sampleBufferOut: &sampleBuffer)
-        guard sampleStatus == noErr, let buffer = sampleBuffer else {
-            return nil
-        }
-
-        return buffer
-    }
-    
-    private func metadataForAssetID(_ assetIdentifier: String) -> [AVMetadataItem] {
-        var items: [AVMetadataItem] = []
-        let keySpaceQuickTimeMetadata = AVMetadataKeySpace.quickTimeMetadata
-
-        func makeStringItem(key: String, dataType: String, value: String) -> AVMetadataItem {
-            let item = AVMutableMetadataItem()
-            item.key = key as (NSCopying & NSObjectProtocol)?
-            item.keySpace = keySpaceQuickTimeMetadata
-            item.value = value as (NSCopying & NSObjectProtocol)?
-            item.dataType = dataType
-            return item
-        }
-
-        func makeNumericItem(key: String, dataType: String, value: NSNumber) -> AVMetadataItem {
-            let item = AVMutableMetadataItem()
-            item.key = key as (NSCopying & NSObjectProtocol)?
-            item.keySpace = keySpaceQuickTimeMetadata
-            item.value = value
-            item.dataType = dataType
-            return item
-        }
-
-        items.append(makeStringItem(key: "com.apple.quicktime.content.identifier",
-                                     dataType: "com.apple.metadata.datatype.UTF-8",
-                                     value: assetIdentifier))
-
-        let dateFormatter = DateFormatter()
-        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
-        dateFormatter.dateFormat = "yyyy:MM:dd HH:mm:ssXXXXX"
-        let formattedDate = dateFormatter.string(from: Date())
-
-        items.append(makeStringItem(key: "com.apple.quicktime.creationdate",
-                                     dataType: "com.apple.metadata.datatype.UTF-8",
-                                     value: formattedDate))
-
-        let device = UIDevice.current
-        items.append(makeStringItem(key: "com.apple.quicktime.make",
-                                     dataType: "com.apple.metadata.datatype.UTF-8",
-                                     value: "Apple"))
-
-        items.append(makeStringItem(key: "com.apple.quicktime.model",
-                                     dataType: "com.apple.metadata.datatype.UTF-8",
-                                     value: device.model))
-
-        items.append(makeStringItem(key: "com.apple.quicktime.software",
-                                     dataType: "com.apple.metadata.datatype.UTF-8",
-                                     value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
-
-        items.append(makeNumericItem(key: "com.apple.quicktime.live-photo.auto",
-                                     dataType: "com.apple.metadata.datatype.int8",
-                                     value: NSNumber(value: Int8(1))))
-
-        items.append(makeNumericItem(key: "com.apple.quicktime.live-photo.full-framerate-playback-intent",
-                                     dataType: "com.apple.metadata.datatype.int8",
-                                     value: NSNumber(value: Int8(1))))
-
-        items.append(makeNumericItem(key: "com.apple.quicktime.live-photo.vitality-score",
-                                     dataType: "com.apple.metadata.datatype.float32",
-                                     value: NSNumber(value: Float(1.0))))
-
-        items.append(makeNumericItem(key: "com.apple.quicktime.live-photo.vitality-score-version",
-                                     dataType: "com.apple.metadata.datatype.int8",
-                                     value: NSNumber(value: Int8(4))))
-
-        return items
-    }
-    
-    private func createMetadataAdaptorForStillImageTime() -> AVAssetWriterInputMetadataAdaptor {
-        let keyStillImageTime = "com.apple.quicktime.still-image-time"
-        let keySpaceQuickTimeMetadata = "mdta"
-        let spec : NSDictionary = [
-            kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier as NSString:
-            "\(keySpaceQuickTimeMetadata)/\(keyStillImageTime)",
-            kCMMetadataFormatDescriptionMetadataSpecificationKey_DataType as NSString:
-            "com.apple.metadata.datatype.int8"            ]
-        var desc : CMFormatDescription? = nil
-        CMMetadataFormatDescriptionCreateWithMetadataSpecifications(allocator: kCFAllocatorDefault, metadataType: kCMMetadataFormatType_Boxed, metadataSpecifications: [spec] as CFArray, formatDescriptionOut: &desc)
-        let input = AVAssetWriterInput(mediaType: .metadata,
-                                       outputSettings: nil, sourceFormatHint: desc)
-        return AVAssetWriterInputMetadataAdaptor(assetWriterInput: input)
-    }
-    
-    private func metadataItemForStillImageTime() -> AVMetadataItem {
-        let item = AVMutableMetadataItem()
-        let keyStillImageTime = "com.apple.quicktime.still-image-time"
-        let keySpaceQuickTimeMetadata = "mdta"
-        item.key = keyStillImageTime as (NSCopying & NSObjectProtocol)?
-        item.keySpace = AVMetadataKeySpace(rawValue: keySpaceQuickTimeMetadata)
-        item.value = 0 as (NSCopying & NSObjectProtocol)?
-        item.dataType = "com.apple.metadata.datatype.int8"
-        return item
-    }
-    
 }
 
-fileprivate extension AVAsset {
-    func countFrames(exact:Bool) -> Int {
-        
-        var frameCount = 0
-        
-        if let videoReader = try? AVAssetReader(asset: self)  {
-            
-            if let videoTrack = self.tracks(withMediaType: .video).first {
-                
-                frameCount = Int(CMTimeGetSeconds(self.duration) * Float64(videoTrack.nominalFrameRate))
-                
-                
-                if exact {
-                    
-                    frameCount = 0
-                    
-                    let videoReaderOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
-                    videoReader.add(videoReaderOutput)
-                    
-                    videoReader.startReading()
-                    
-                    // count frames
-                    while true {
-                        let sampleBuffer = videoReaderOutput.copyNextSampleBuffer()
-                        if sampleBuffer == nil {
-                            break
-                        }
-                        frameCount += 1
-                    }
-                    
-                    videoReader.cancelReading()
-                }
-                
-                
-            }
-        }
-        
-        return frameCount
-    }
-    
-    func stillImageTime() -> CMTime?  {
-        
-        var stillTime:CMTime? = nil
-        
-        if let videoReader = try? AVAssetReader(asset: self)  {
-            
-            if let metadataTrack = self.tracks(withMediaType: .metadata).first {
-                
-                let videoReaderOutput = AVAssetReaderTrackOutput(track: metadataTrack, outputSettings: nil)
-                
-                videoReader.add(videoReaderOutput)
-                
-                videoReader.startReading()
-                
-                let keyStillImageTime = "com.apple.quicktime.still-image-time"
-                let keySpaceQuickTimeMetadata = "mdta"
-                
-                var found = false
-                
-                while found == false {
-                    if let sampleBuffer = videoReaderOutput.copyNextSampleBuffer() {
-                        if CMSampleBufferGetNumSamples(sampleBuffer) != 0 {
-                            let group = AVTimedMetadataGroup(sampleBuffer: sampleBuffer)
-                            for item in group?.items ?? [] {
-                                if item.key as? String == keyStillImageTime && item.keySpace!.rawValue == keySpaceQuickTimeMetadata {
-                                    stillTime = group?.timeRange.start
-                                    //print("stillImageTime = \(CMTimeGetSeconds(stillTime!))")
-                                    found = true
-                                    break
-                                }
-                            }
-                        }
-                    }
-                    else {
-                        break;
-                    }
-                }
-                
-                videoReader.cancelReading()
-                
-            }
-        }
-        
-        return stillTime
-    }
-    
-    func makeStillImageTimeRange(percent:Float, inFrameCount:Int = 0) -> CMTimeRange {
-        
-        var time = self.duration
-        
-        var frameCount = inFrameCount
-        
-        if frameCount == 0 {
-            frameCount = self.countFrames(exact: true)
-        }
-        
-        let frameDuration = Int64(Float(time.value) / Float(frameCount))
-        
-        time.value = Int64(Float(time.value) * percent)
-        
-        //print("stillImageTime = \(CMTimeGetSeconds(time))")
-        
-        return CMTimeRangeMake(start: time, duration: CMTimeMake(value: frameDuration, timescale: time.timescale))
-    }
-    
-    func getAssetFrame(percent:Float) -> UIImage?
-    {
-        
-        let imageGenerator = AVAssetImageGenerator(asset: self)
-        imageGenerator.appliesPreferredTrackTransform = true
-        
-        imageGenerator.requestedTimeToleranceAfter = CMTimeMake(value: 1,timescale: 100)
-        imageGenerator.requestedTimeToleranceBefore = CMTimeMake(value: 1,timescale: 100)
-        
-        var time = self.duration
-        
-        time.value = Int64(Float(time.value) * percent)
-        
-        do {
-            var actualTime = CMTime.zero
-            let imageRef = try imageGenerator.copyCGImage(at: time, actualTime:&actualTime)
-            
-            let img = UIImage(cgImage: imageRef)
-            
-            return img
-        }
-        catch let error as NSError
-        {
-            print("Image generation failed with error \(error)")
-            return nil
-        }
-    }
-}
