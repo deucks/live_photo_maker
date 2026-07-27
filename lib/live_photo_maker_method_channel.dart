@@ -13,11 +13,12 @@ class MethodChannelLivePhotoMaker extends LivePhotoMakerPlatform {
 
   @override
   Future<bool> create({
-    required String coverImage,
+    String? coverImage,
     String? imagePath,
     String? voicePath,
     required int width,
     required int height,
+    double? startSeconds,
   }) async {
     assert(Platform.isIOS, 'Live photo can only be used on the iOS platform.');
 
@@ -34,7 +35,15 @@ class MethodChannelLivePhotoMaker extends LivePhotoMakerPlatform {
     }
 
     try {
-      String result = await methodChannel.invokeMethod("create_live_photo", [coverImage, movPath]);
+      final String result = await methodChannel.invokeMethod(
+        "create_live_photo",
+        <String, dynamic>{
+          'videoPath': movPath,
+          if (coverImage != null && coverImage.isNotEmpty)
+            'coverImage': coverImage,
+          if (startSeconds != null) 'startSeconds': startSeconds,
+        },
+      );
       return result == 'success';
     } on PlatformException catch (e) {
       throw LivePhotoException(e.message ?? 'Live Photo creation failed.');

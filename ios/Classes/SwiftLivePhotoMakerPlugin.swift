@@ -30,11 +30,22 @@ public class SwiftLivePhotoPlugin: NSObject, FlutterPlugin {
              let fileURL = sync.createMovieFrom(url: imageURL, duration: 4)
              result(fileURL.absoluteString.replacingOccurrences(of: "file://", with: ""))
       }else if method == "create_live_photo" {
-               let pathList = arguments as! Array<String>
-               let photoURL = URL.init(fileURLWithPath: pathList.first!)
-               let sourceVideoPath = URL.init(fileURLWithPath: pathList.last!)
+               guard let args = arguments as? [String: Any],
+                     let videoPath = args["videoPath"] as? String else {
+                   result(FlutterError(code: "live_photo_bad_arguments",
+                                       message: "create_live_photo expects a map containing videoPath.",
+                                       details: nil))
+                   return
+               }
+               let sourceVideoPath = URL.init(fileURLWithPath: videoPath)
+               // Cover is optional: with none supplied the pipeline lifts the
+               // key photo out of the processed clip itself.
+               let coverPath = args["coverImage"] as? String
+               let photoURL = (coverPath?.isEmpty == false) ? URL.init(fileURLWithPath: coverPath!) : nil
+               // Where in the source the kept window starts. nil = middle.
+               let startSeconds = args["startSeconds"] as? Double
 
-              LivePhotoMaker.generate(from: photoURL, videoURL: sourceVideoPath, progress: { (percent) in
+              LivePhotoMaker.generate(from: photoURL, videoURL: sourceVideoPath, startSeconds: startSeconds, progress: { (percent) in
               }) { (livePhoto, resources, errorMessage) in
                   guard let resources = resources else {
                       result(FlutterError(code: "live_photo_create_failed",

@@ -165,7 +165,13 @@ class Converter4Video: NSObject {
         }
     }
 
-    func durationVideo(at inputPath: String, outputPath: String, targetDuration: Double, completion: @escaping (Bool, Error?) -> Void) {
+    /// Reduces the source to exactly `targetDuration`.
+    ///
+    /// When the source is longer, `startSeconds` picks where the kept window
+    /// begins (clamped so the window always fits). Pass nil to keep the old
+    /// behaviour of taking the middle. Shorter sources are padded with their
+    /// first and last frames.
+    func durationVideo(at inputPath: String, outputPath: String, targetDuration: Double, startSeconds: Double? = nil, completion: @escaping (Bool, Error?) -> Void) {
         let asset = AVURLAsset(url: URL(fileURLWithPath: inputPath))
         let length = CMTimeGetSeconds(asset.duration)
         let timeScale = asset.duration.timescale == 0 ? 600 : asset.duration.timescale
@@ -238,8 +244,11 @@ class Converter4Video: NSObject {
                 self.exportAsset(composition, preset: AVAssetExportPresetHighestQuality, outputURL: URL(fileURLWithPath: outputPath), completion: completion)
             }
         } else {
-            let startTime = length / 2 - targetDuration / 2
-            let endTime = length / 2 + targetDuration / 2
+            // Clamp the requested start so the full window stays inside the
+            // asset; fall back to the centred window when no start is given.
+            let requestedStart = startSeconds ?? (length / 2 - targetDuration / 2)
+            let startTime = min(max(requestedStart, 0), length - targetDuration)
+            let endTime = startTime + targetDuration
             guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
                 completion(false, NSError(domain: "VideoProcessing", code: -1, userInfo: nil))
                 return

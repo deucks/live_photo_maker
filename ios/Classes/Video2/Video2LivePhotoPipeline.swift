@@ -26,7 +26,10 @@ public final class Video2LivePhotoPipeline: NSObject {
         self.metadataURL = metadataURL
     }
 
-    func process(videoURL: URL, cacheDirectory: URL, customImageURL: URL?, completion: @escaping (Output?, String?) -> Void) {
+    /// `startSeconds` selects where in the source the kept window begins.
+    /// Pass nil to take the middle. It is ignored when the source is already
+    /// at or under `targetVideoSeconds`, or when the fast path applies.
+    func process(videoURL: URL, cacheDirectory: URL, customImageURL: URL?, startSeconds: Double? = nil, completion: @escaping (Output?, String?) -> Void) {
         guard let metadataURL = metadataURL else {
             completion(nil, "metadata template missing from plugin bundle")
             return
@@ -83,7 +86,7 @@ public final class Video2LivePhotoPipeline: NSObject {
             }
         }
 
-        converter.durationVideo(at: videoURL.path, outputPath: durationURL.path, targetDuration: targetVideoSeconds) { success, error in
+        converter.durationVideo(at: videoURL.path, outputPath: durationURL.path, targetDuration: targetVideoSeconds, startSeconds: startSeconds) { success, error in
             guard success else {
                 DispatchQueue.main.async { completion(nil, "duration adjust failed: \(error?.localizedDescription ?? "unknown")") }
                 return

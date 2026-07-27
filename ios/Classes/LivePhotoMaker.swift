@@ -41,10 +41,11 @@ class LivePhotoMaker {
 
     public class func generate(from imageURL: URL?,
                                videoURL: URL,
+                               startSeconds: Double? = nil,
                                progress: @escaping (CGFloat) -> Void,
                                completion: @escaping (PHLivePhoto?, LivePhotoResources?, String?) -> Void) {
         queue.async {
-            shared.generate(from: imageURL, videoURL: videoURL, progress: progress, completion: completion)
+            shared.generate(from: imageURL, videoURL: videoURL, startSeconds: startSeconds, progress: progress, completion: completion)
         }
     }
 
@@ -68,6 +69,7 @@ class LivePhotoMaker {
 
     private func generate(from imageURL: URL?,
                           videoURL: URL,
+                          startSeconds: Double? = nil,
                           progress: @escaping (CGFloat) -> Void,
                           completion: @escaping (PHLivePhoto?, LivePhotoResources?, String?) -> Void) {
         guard let cacheDirectory = cacheDirectory, let metadataURL = metadataTemplateURL else {
@@ -86,7 +88,7 @@ class LivePhotoMaker {
         DispatchQueue.main.async { progress(0.0) }
 
         let pipeline = Video2LivePhotoPipeline(metadataURL: metadataURL)
-        pipeline.process(videoURL: videoURL, cacheDirectory: cacheDirectory, customImageURL: imageURL) { output, errorMessage in
+        pipeline.process(videoURL: videoURL, cacheDirectory: cacheDirectory, customImageURL: imageURL, startSeconds: startSeconds) { output, errorMessage in
             guard let output = output else {
                 DispatchQueue.main.async { completion(nil, nil, errorMessage ?? "Live Photo pipeline failed") }
                 return

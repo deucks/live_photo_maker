@@ -29,11 +29,12 @@ abstract class LivePhotoMakerPlatform extends PlatformInterface {
 
 
   Future<bool> create({
-    required String coverImage,
+    String? coverImage,
     String? imagePath,
     String? voicePath,
     required int width,
     required int height,
+    double? startSeconds,
   }) {
     throw UnimplementedError('create() has not been implemented.');
   }

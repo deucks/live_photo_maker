@@ -3,18 +3,22 @@ import 'live_photo_maker_platform_interface.dart';
 export 'live_photo_maker_platform_interface.dart' show LivePhotoException;
 
 class LivePhotoMaker {
-  /// [coverImage] The cover image of live photo
+  /// [coverImage] Still shown when the Live Photo isn't animating. Omit it
+  /// and the key photo is lifted from the processed clip itself.
   /// [imagePath] Picture content of live photos
   /// [voicePath] Video content of live photos
+  /// [startSeconds] Where in [voicePath] the kept window begins. The window
+  /// is clamped so it always fits inside the source. Omit to take the middle.
   ///
   /// Throws [LivePhotoException] with the native failure reason when
   /// creation or the library save fails.
   static Future<bool> create({
-    required String coverImage,
+    String? coverImage,
     String? imagePath,
     String? voicePath,
     required int width,
     required int height,
+    double? startSeconds,
   }) async {
     return LivePhotoMakerPlatform.instance.create(
       coverImage: coverImage,
@@ -22,6 +26,7 @@ class LivePhotoMaker {
       voicePath: voicePath,
       width: width,
       height: height,
+      startSeconds: startSeconds,
     );
   }
 }
