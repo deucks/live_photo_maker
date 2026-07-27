@@ -21,6 +21,10 @@ class LivePhotoMaker {
         return fullDirectory
     }()
 
+    private lazy var metadataTemplateURL: URL? = {
+        Bundle(for: LivePhotoMaker.self).url(forResource: "metadata", withExtension: "mov")
+    }()
+
     deinit {
         if let cacheDirectory = cacheDirectory {
             try? FileManager.default.removeItem(at: cacheDirectory)
@@ -55,25 +59,10 @@ class LivePhotoMaker {
             // The library copies the resource data during the change
             // block, so the staged pair is dead weight either way —
             // without this the cache grew by a few MB per creation.
-            //
-            // Only files this class staged are removed. When the caller
-            // supplied a clip that was already a paired video, the
-            // pipeline hands it straight through, and deleting an input
-            // we do not own is not ours to do.
-            shared.removeIfStaged(resources.pairedVideo)
-            shared.removeIfStaged(resources.pairedImage)
+            try? FileManager.default.removeItem(at: resources.pairedVideo)
+            try? FileManager.default.removeItem(at: resources.pairedImage)
             completion(success, error?.localizedDescription)
         })
-    }
-
-    /// Deletes `url` only if it sits inside this class's cache
-    /// directory, i.e. it was staged here rather than passed in.
-    private func removeIfStaged(_ url: URL) {
-        guard let cacheDirectory = cacheDirectory else { return }
-        let staged = url.standardizedFileURL.path
-            .hasPrefix(cacheDirectory.standardizedFileURL.path)
-        guard staged else { return }
-        try? FileManager.default.removeItem(at: url)
     }
 
     // MARK: - Generation
@@ -83,8 +72,8 @@ class LivePhotoMaker {
                           startSeconds: Double? = nil,
                           progress: @escaping (CGFloat) -> Void,
                           completion: @escaping (PHLivePhoto?, LivePhotoResources?, String?) -> Void) {
-        guard let cacheDirectory = cacheDirectory else {
-            DispatchQueue.main.async { completion(nil, nil, "plugin cache directory unavailable") }
+        guard let cacheDirectory = cacheDirectory, let metadataURL = metadataTemplateURL else {
+            DispatchQueue.main.async { completion(nil, nil, "plugin cache directory or metadata template unavailable") }
             return
         }
 
@@ -98,7 +87,7 @@ class LivePhotoMaker {
 
         DispatchQueue.main.async { progress(0.0) }
 
-        let pipeline = Video2LivePhotoPipeline()
+        let pipeline = Video2LivePhotoPipeline(metadataURL: metadataURL)
         pipeline.process(videoURL: videoURL, cacheDirectory: cacheDirectory, customImageURL: imageURL, startSeconds: startSeconds) { output, errorMessage in
             guard let output = output else {
                 DispatchQueue.main.async { completion(nil, nil, errorMessage ?? "Live Photo pipeline failed") }

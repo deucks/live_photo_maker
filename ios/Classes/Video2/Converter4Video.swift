@@ -2,6 +2,9 @@ import Foundation
 import AVFoundation
 
 class Converter4Video: NSObject {
+    private let metadataContentIdentifierKey = "com.apple.quicktime.content.identifier"
+    private let metadataStillImageTimeKey = "com.apple.quicktime.still-image-time"
+    private let metadataKeySpace = "mdta"
     private let path: String
 
     private lazy var asset: AVURLAsset = {
@@ -13,162 +16,147 @@ class Converter4Video: NSObject {
         self.path = path
     }
 
-    /// Writes the paired video: copies the source frames and attaches
-    /// the content identifier and still-image-time marker.
-    ///
-    /// With `passthrough` the compressed samples are copied as-is (no
-    /// decode/re-encode) — use it when the source is already encoded
-    /// exactly as the paired video should be.
-    ///
-    /// Both metadata pieces are synthesised. An earlier version copied a
-    /// timed metadata track out of a bundled template movie and string-
-    /// replaced its UUID, which added a second marker carrying another
-    /// video's sample timing, and made a missing bundle resource fatal.
-    func write(to destination: String,
-               assetIdentifier: String,
-               passthrough: Bool = false,
-               completion: @escaping (Bool, Error?) -> Void) {
+    /// Writes the paired video: copies the source frames and attaches the
+    /// content identifier, still-image-time marker, and the timed metadata
+    /// track from the template. With `passthrough` the compressed samples
+    /// are copied as-is (no decode/re-encode) — use it when the source is
+    /// already encoded exactly as the paired video should be.
+    func write(to destination: String, assetIdentifier: String, metadataURL: URL, passthrough: Bool = false, completion: @escaping (Bool, Error?) -> Void) {
         do {
-            let reader = try AVAssetReader(asset: asset)
-            let writer = try AVAssetWriter(outputURL: URL(fileURLWithPath: destination),
-                                           fileType: .mov)
+            let metadataAsset = AVURLAsset(url: metadataURL)
+            let templateIdentifier = metadataAsset.metadata(forFormat: .quickTimeMetadata).first(where: { item in
+                (item.key as? String) == metadataContentIdentifierKey
+            })?.value as? String
+            let readerVideo = try AVAssetReader(asset: asset)
+            let readerMetadata = try AVAssetReader(asset: metadataAsset)
+            let writer = try AVAssetWriter(outputURL: URL(fileURLWithPath: destination), fileType: .mov)
 
             var videoIOs = [(AVAssetWriterInput, AVAssetReaderTrackOutput)]()
+            var metadataIOs = [(AVAssetWriterInputMetadataAdaptor, AVAssetReaderTrackOutput)]()
 
             loadTracks(asset: self.asset, type: .video) { videoTracks in
-                guard let track = videoTracks.first else {
-                    completion(false, NSError(domain: "VideoProcessing", code: -1, userInfo: [
-                        NSLocalizedDescriptionKey: "source has no video track"]))
-                    return
+                for track in videoTracks {
+                    // nil output settings = hand back the compressed samples.
+                    let readerSettings: [String: Any]? = passthrough
+                        ? nil
+                        : [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA as UInt32)]
+                    let trackReaderOutput = AVAssetReaderTrackOutput(track: track, outputSettings: readerSettings)
+                    if readerVideo.canAdd(trackReaderOutput) {
+                        readerVideo.add(trackReaderOutput)
+                    }
+
+                    let videoInput: AVAssetWriterInput
+                    if passthrough, let format = track.formatDescriptions.first {
+                        videoInput = AVAssetWriterInput(mediaType: .video,
+                                                        outputSettings: nil,
+                                                        sourceFormatHint: (format as! CMFormatDescription))
+                    } else {
+                        videoInput = AVAssetWriterInput(mediaType: .video,
+                                                        outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264,
+                                                                         AVVideoWidthKey: track.naturalSize.width,
+                                                                         AVVideoHeightKey: track.naturalSize.height])
+                    }
+                    videoInput.transform = track.preferredTransform
+                    // Offline transcode — real-time mode can silently drop
+                    // frames on slower devices.
+                    videoInput.expectsMediaDataInRealTime = false
+                    if writer.canAdd(videoInput) {
+                        writer.add(videoInput)
+                        videoIOs.append((videoInput, trackReaderOutput))
+                    }
                 }
 
-                // nil output settings = hand back the compressed samples.
-                let readerSettings: [String: Any]? = passthrough
-                    ? nil
-                    : [kCVPixelBufferPixelFormatTypeKey as String:
-                        NSNumber(value: kCVPixelFormatType_32BGRA as UInt32)]
-                let trackReaderOutput = AVAssetReaderTrackOutput(track: track,
-                                                                 outputSettings: readerSettings)
-                guard reader.canAdd(trackReaderOutput) else {
-                    completion(false, NSError(domain: "VideoProcessing", code: -1, userInfo: [
-                        NSLocalizedDescriptionKey: "reader rejected the video track"]))
-                    return
-                }
-                reader.add(trackReaderOutput)
+                self.loadTracks(asset: metadataAsset, type: .metadata) { metadataTracks in
+                    for track in metadataTracks {
+                        let trackReaderOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+                        if readerMetadata.canAdd(trackReaderOutput) {
+                            readerMetadata.add(trackReaderOutput)
+                        }
 
-                let videoInput: AVAssetWriterInput
-                // CFTypeRef from formatDescriptions — checked rather than
-                // force-cast, since a malformed source should surface as a
-                // failure and not a crash.
-                if passthrough, let format = track.formatDescriptions.first,
-                   CFGetTypeID(format as CFTypeRef) == CMFormatDescriptionGetTypeID() {
-                    videoInput = AVAssetWriterInput(
-                        mediaType: .video,
-                        outputSettings: nil,
-                        sourceFormatHint: (format as! CMFormatDescription))
-                } else {
-                    // naturalSize is pre-rotation, so a rotated source
-                    // needs the displayed size, not the stored one.
-                    let displayed = track.naturalSize.applying(track.preferredTransform)
-                    videoInput = AVAssetWriterInput(
-                        mediaType: .video,
-                        outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264,
-                                         AVVideoWidthKey: abs(displayed.width),
-                                         AVVideoHeightKey: abs(displayed.height)])
-                }
-                videoInput.transform = track.preferredTransform
-                // Offline transcode — real-time mode can silently drop
-                // frames on slower devices.
-                videoInput.expectsMediaDataInRealTime = false
-                guard writer.canAdd(videoInput) else {
-                    completion(false, NSError(domain: "VideoProcessing", code: -1, userInfo: [
-                        NSLocalizedDescriptionKey: "writer rejected the video input"]))
-                    return
-                }
-                writer.add(videoInput)
-                videoIOs.append((videoInput, trackReaderOutput))
+                        let writerInput = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil, sourceFormatHint: track.formatDescriptions.first as! CMFormatDescription)
+                        writerInput.expectsMediaDataInRealTime = false
+                        let adaptor = AVAssetWriterInputMetadataAdaptor(assetWriterInput: writerInput)
+                        if writer.canAdd(writerInput) {
+                            writer.add(writerInput)
+                            metadataIOs.append((adaptor, trackReaderOutput))
+                        }
+                    }
 
-                writer.metadata = [LivePhotoMetadata.contentIdentifierItem(assetIdentifier)]
-                guard let stillAdaptor = LivePhotoMetadata.stillImageTimeAdaptor(),
-                      writer.canAdd(stillAdaptor.assetWriterInput) else {
-                    completion(false, NSError(domain: "VideoProcessing", code: -1, userInfo: [
-                        NSLocalizedDescriptionKey: "could not build the still-image-time track"]))
-                    return
-                }
-                writer.add(stillAdaptor.assetWriterInput)
+                    writer.metadata = [self.metadataForAssetID(assetIdentifier)]
+                    let stillImageAdaptor = self.createMetadataAdaptorForStillImageTime()
+                    writer.add(stillImageAdaptor.assetWriterInput)
 
-                guard writer.startWriting() else {
-                    completion(false, writer.error ?? NSError(
-                        domain: "VideoProcessing", code: -1, userInfo: [
-                            NSLocalizedDescriptionKey: "writer would not start"]))
-                    return
-                }
-                guard reader.startReading() else {
-                    writer.cancelWriting()
-                    completion(false, reader.error ?? NSError(
-                        domain: "VideoProcessing", code: -1, userInfo: [
-                            NSLocalizedDescriptionKey: "reader would not start"]))
-                    return
-                }
-                writer.startSession(atSourceTime: .zero)
+                    writer.startWriting()
+                    readerVideo.startReading()
+                    readerMetadata.startReading()
+                    writer.startSession(atSourceTime: .zero)
 
-                let nominal = track.nominalFrameRate > 0 ? track.nominalFrameRate : 30
-                let marker = AVTimedMetadataGroup(
-                    items: [LivePhotoMetadata.stillImageTimeItem()],
-                    timeRange: LivePhotoMetadata.stillImageTimeRange(
-                        duration: self.asset.duration,
-                        fraction: ContractClipRenderer.stillImageFraction,
-                        frameRate: Int32(nominal.rounded())))
-                guard stillAdaptor.append(marker) else {
-                    reader.cancelReading()
-                    writer.cancelWriting()
-                    completion(false, NSError(domain: "VideoProcessing", code: -1, userInfo: [
-                        NSLocalizedDescriptionKey: "could not append the still-image-time marker"]))
-                    return
-                }
-                stillAdaptor.assetWriterInput.markAsFinished()
+                    let frameCount = max(self.asset.countFrames(exact: false), 1)
+                    stillImageAdaptor.append(AVTimedMetadataGroup(items: [self.metadataForStillImageTime()],
+                                                                 timeRange: self.asset.makeStillImageTimeRange(percent: 0.5,
+                                                                                                            inFrameCount: frameCount)))
 
-                let dispatchGroup = DispatchGroup()
-                var appendFailure: Error?
+                    let dispatchGroup = DispatchGroup()
 
-                for (videoInput, videoOutput) in videoIOs {
-                    dispatchGroup.enter()
-                    videoInput.requestMediaDataWhenReady(
-                        on: DispatchQueue(label: "assetWriterQueue.video")) {
-                        while videoInput.isReadyForMoreMediaData {
-                            guard let sampleBuffer = videoOutput.copyNextSampleBuffer() else {
-                                videoInput.markAsFinished()
-                                dispatchGroup.leave()
-                                return
-                            }
-                            if !videoInput.append(sampleBuffer) {
-                                appendFailure = writer.error ?? NSError(
-                                    domain: "VideoProcessing", code: -1, userInfo: [
-                                        NSLocalizedDescriptionKey: "could not append a video sample"])
-                                videoInput.markAsFinished()
-                                dispatchGroup.leave()
-                                return
+                    for (videoInput, videoOutput) in videoIOs {
+                        dispatchGroup.enter()
+                        videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "assetWriterQueue.video")) {
+                            while videoInput.isReadyForMoreMediaData {
+                                if let sampleBuffer = videoOutput.copyNextSampleBuffer() {
+                                    videoInput.append(sampleBuffer)
+                                } else {
+                                    videoInput.markAsFinished()
+                                    dispatchGroup.leave()
+                                    break
+                                }
                             }
                         }
                     }
-                }
 
-                dispatchGroup.notify(queue: .main) {
-                    if let appendFailure = appendFailure {
-                        reader.cancelReading()
-                        writer.cancelWriting()
-                        completion(false, appendFailure)
-                        return
+                    for (metadataAdaptor, metadataOutput) in metadataIOs {
+                        dispatchGroup.enter()
+                        metadataAdaptor.assetWriterInput.requestMediaDataWhenReady(on: DispatchQueue(label: "assetWriterQueue.metadata")) {
+                            while metadataAdaptor.assetWriterInput.isReadyForMoreMediaData {
+                                guard let sampleBuffer = metadataOutput.copyNextSampleBuffer() else {
+                                    metadataAdaptor.assetWriterInput.markAsFinished()
+                                    dispatchGroup.leave()
+                                    break
+                                }
+                                guard let group = AVTimedMetadataGroup(sampleBuffer: sampleBuffer) else { continue }
+                                if let templateIdentifier = templateIdentifier {
+                                    let rewrittenItems: [AVMetadataItem] = group.items.compactMap { item in
+                                        guard let mutable = item.mutableCopy() as? AVMutableMetadataItem else { return item }
+                                        if let value = mutable.value as? String,
+                                           value.contains(templateIdentifier) {
+                                            mutable.value = value.replacingOccurrences(of: templateIdentifier, with: assetIdentifier) as (NSCopying & NSObjectProtocol)?
+                                        }
+                                        return mutable.copy() as? AVMetadataItem
+                                    }
+                                    let rewrittenGroup = AVTimedMetadataGroup(items: rewrittenItems, timeRange: group.timeRange)
+                                    metadataAdaptor.append(rewrittenGroup)
+                                } else {
+                                    metadataAdaptor.append(group)
+                                }
+                            }
+                        }
                     }
-                    guard reader.status == .completed, writer.status == .writing else {
-                        writer.cancelWriting()
-                        completion(false, reader.error ?? writer.error ?? NSError(
-                            domain: "VideoProcessing", code: -1, userInfo: [
-                                NSLocalizedDescriptionKey: "paired video write did not complete"]))
-                        return
-                    }
-                    writer.finishWriting {
-                        completion(writer.status == .completed, writer.error)
+
+                    dispatchGroup.notify(queue: .main) {
+                        if readerVideo.status == .completed && readerMetadata.status == .completed && writer.status == .writing {
+                            writer.finishWriting {
+                                completion(writer.status == .completed, writer.error)
+                            }
+                        } else {
+                            if let error = readerVideo.error {
+                                completion(false, error)
+                            } else if let error = readerMetadata.error {
+                                completion(false, error)
+                            } else if let error = writer.error {
+                                completion(false, error)
+                            } else {
+                                completion(false, NSError(domain: "VideoProcessing", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unknown error"]))
+                            }
+                        }
                     }
                 }
             }
@@ -387,6 +375,46 @@ class Converter4Video: NSObject {
         }
     }
 
+    private func metadata() -> [AVMetadataItem] {
+        return asset.metadata(forFormat: AVMetadataFormat.quickTimeMetadata)
+    }
+
+    private func createMetadataAdaptorForStillImageTime() -> AVAssetWriterInputMetadataAdaptor {
+        let keyStillImageTime = metadataStillImageTimeKey
+        let keySpaceQuickTimeMetadata = metadataKeySpace
+        let spec: NSDictionary = [
+            kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier as NSString:
+                "\(keySpaceQuickTimeMetadata)/\(keyStillImageTime)",
+            kCMMetadataFormatDescriptionMetadataSpecificationKey_DataType as NSString:
+                "com.apple.metadata.datatype.int8"
+        ]
+        var desc: CMFormatDescription? = nil
+        CMMetadataFormatDescriptionCreateWithMetadataSpecifications(allocator: kCFAllocatorDefault,
+                                                                    metadataType: kCMMetadataFormatType_Boxed,
+                                                                    metadataSpecifications: [spec] as CFArray,
+                                                                    formatDescriptionOut: &desc)
+        let input = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil, sourceFormatHint: desc)
+        return AVAssetWriterInputMetadataAdaptor(assetWriterInput: input)
+    }
+
+    private func metadataForAssetID(_ assetIdentifier: String) -> AVMetadataItem {
+        let item = AVMutableMetadataItem()
+        item.key = metadataContentIdentifierKey as (NSCopying & NSObjectProtocol)?
+        item.keySpace = AVMetadataKeySpace(rawValue: metadataKeySpace)
+        item.value = assetIdentifier as (NSCopying & NSObjectProtocol)?
+        item.dataType = "com.apple.metadata.datatype.UTF-8"
+        return item
+    }
+
+    private func metadataForStillImageTime() -> AVMetadataItem {
+        let item = AVMutableMetadataItem()
+        item.key = metadataStillImageTimeKey as (NSCopying & NSObjectProtocol)?
+        item.keySpace = AVMetadataKeySpace.quickTimeMetadata
+        item.value = 0 as (NSCopying & NSObjectProtocol)?
+        item.dataType = kCMMetadataBaseDataType_SInt8 as String
+        return item.copy() as! AVMetadataItem
+    }
+
     private func loadTracks(asset: AVAsset, type: AVMediaType, completion: @escaping ([AVAssetTrack]) -> Void) {
         if #available(iOS 15.0, *) {
             asset.loadTracks(withMediaType: type) { tracks, error in
@@ -459,10 +487,7 @@ class Converter4Video: NSObject {
                 return
             }
 
-            guard writer.startWriting() else {
-                completion(false)
-                return
-            }
+            writer.startWriting()
             writer.startSession(atSourceTime: .zero)
 
             let frameDuration = CMTime(value: 1, timescale: 30)

@@ -41,16 +41,11 @@ public class SwiftLivePhotoPlugin: NSObject, FlutterPlugin {
                    return
                }
                DispatchQueue.global(qos: .userInitiated).async {
-                   // The clip is written as a finished paired video: this
-                   // identifier goes in as its content identifier, and
-                   // create_live_photo reads it back off the file rather
-                   // than re-muxing to attach one.
                    ContractClipRenderer().render(
                        sourceURL: URL(fileURLWithPath: sourcePath),
                        startSeconds: startSeconds,
                        windowSeconds: windowSeconds,
-                       outputURL: URL(fileURLWithPath: outputPath),
-                       assetIdentifier: UUID().uuidString) { outcome in
+                       outputURL: URL(fileURLWithPath: outputPath)) { outcome in
                        DispatchQueue.main.async {
                            switch outcome {
                            case .success(let url):
