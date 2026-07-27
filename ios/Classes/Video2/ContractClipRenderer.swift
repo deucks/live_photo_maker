@@ -46,6 +46,11 @@ final class ContractClipRenderer {
         }
     }
 
+    /// Where the still is taken from, as a fraction of the clip. The
+    /// key-photo sampler and the still-image-time marker both read this
+    /// so they cannot drift apart.
+    static let stillImageFraction = 0.5
+
     private let spec: Spec
 
     init(spec: Spec = Spec()) {
@@ -57,10 +62,15 @@ final class ContractClipRenderer {
     /// Takes `windowSeconds` of source starting at `startSeconds` and
     /// squeezes it into the paired duration — so a 3s window becomes a
     /// ~3.27x retime, and doubling the window doubles apparent speed.
+    /// `assetIdentifier` is embedded as the content identifier, and a
+    /// still-image-time marker is written at the clip midpoint, so the
+    /// output is already a valid paired video. Pass the same identifier
+    /// to the still and no re-mux is needed afterwards.
     func render(sourceURL: URL,
                 startSeconds: Double,
                 windowSeconds: Double,
                 outputURL: URL,
+                assetIdentifier: String,
                 completion: @escaping (Result<URL, Error>) -> Void) {
         let asset = AVURLAsset(url: sourceURL)
         guard let sourceTrack = asset.tracks(withMediaType: .video).first else {
@@ -90,7 +100,8 @@ final class ContractClipRenderer {
                 try encode(composition: composition,
                            videoComposition: videoComposition,
                            bitrate: bitrate,
-                           outputURL: outputURL)
+                           outputURL: outputURL,
+                           assetIdentifier: assetIdentifier)
             } catch {
                 lastError = error
                 continue
@@ -189,7 +200,8 @@ final class ContractClipRenderer {
     private func encode(composition: AVMutableComposition,
                         videoComposition: AVMutableVideoComposition,
                         bitrate: Int,
-                        outputURL: URL) throws {
+                        outputURL: URL,
+                        assetIdentifier: String) throws {
         let reader = try AVAssetReader(asset: composition)
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
 
@@ -233,6 +245,18 @@ final class ContractClipRenderer {
         }
         writer.add(writerInput)
 
+        // Live Photo metadata goes in during this same pass. Attaching
+        // it afterwards would mean reading the file back and rewriting
+        // it purely to add two small pieces of metadata.
+        writer.metadata = [LivePhotoMetadata.contentIdentifierItem(assetIdentifier)]
+        guard let stillAdaptor = LivePhotoMetadata.stillImageTimeAdaptor() else {
+            throw RenderError.encodeFailed("could not build the still-image-time track")
+        }
+        guard writer.canAdd(stillAdaptor.assetWriterInput) else {
+            throw RenderError.encodeFailed("writer rejected the metadata input")
+        }
+        writer.add(stillAdaptor.assetWriterInput)
+
         guard writer.startWriting() else {
             throw RenderError.encodeFailed(
                 writer.error?.localizedDescription ?? "writer would not start")
@@ -243,6 +267,22 @@ final class ContractClipRenderer {
             throw RenderError.encodeFailed(
                 reader.error?.localizedDescription ?? "reader would not start")
         }
+
+        // Marker sits at the midpoint, matching where the key photo is
+        // sampled from. Appended before the video samples so the track
+        // exists regardless of how the video pass terminates.
+        let markerRange = LivePhotoMetadata.stillImageTimeRange(
+            duration: spec.pairedDuration,
+            fraction: Self.stillImageFraction,
+            frameRate: spec.frameRate)
+        let marker = AVTimedMetadataGroup(
+            items: [LivePhotoMetadata.stillImageTimeItem()], timeRange: markerRange)
+        if !stillAdaptor.append(marker) {
+            reader.cancelReading()
+            writer.cancelWriting()
+            throw RenderError.encodeFailed("could not append the still-image-time marker")
+        }
+        stillAdaptor.assetWriterInput.markAsFinished()
 
         let queue = DispatchQueue(label: "com.deucks.livephoto.contractRender")
         let done = DispatchSemaphore(value: 0)
