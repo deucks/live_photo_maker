@@ -35,17 +35,23 @@ public class SwiftLivePhotoPlugin: NSObject, FlutterPlugin {
                let sourceVideoPath = URL.init(fileURLWithPath: pathList.last!)
 
               LivePhotoMaker.generate(from: photoURL, videoURL: sourceVideoPath, progress: { (percent) in
-              }) { (livePhoto, resources) in
-                  if let resources = resources {
-                      LivePhotoMaker.saveToLibrary(resources, completion: { (success) in
-                          if success {
-                                result("success")
-                          }
-                          else {
-                                 result("default")
-                          }
-                      })
+              }) { (livePhoto, resources, errorMessage) in
+                  guard let resources = resources else {
+                      result(FlutterError(code: "live_photo_create_failed",
+                                          message: errorMessage ?? "Live Photo generation failed.",
+                                          details: nil))
+                      return
                   }
+                  LivePhotoMaker.saveToLibrary(resources, completion: { (success, saveError) in
+                      if success {
+                            result("success")
+                      }
+                      else {
+                             result(FlutterError(code: "live_photo_save_failed",
+                                                 message: saveError ?? "Couldn't save the Live Photo to the photo library.",
+                                                 details: nil))
+                      }
+                  })
               }
            }
   }

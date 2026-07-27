@@ -16,7 +16,12 @@ class Converter4Video: NSObject {
         self.path = path
     }
 
-    func write(to destination: String, assetIdentifier: String, metadataURL: URL, completion: @escaping (Bool, Error?) -> Void) {
+    /// Writes the paired video: copies the source frames and attaches the
+    /// content identifier, still-image-time marker, and the timed metadata
+    /// track from the template. With `passthrough` the compressed samples
+    /// are copied as-is (no decode/re-encode) — use it when the source is
+    /// already encoded exactly as the paired video should be.
+    func write(to destination: String, assetIdentifier: String, metadataURL: URL, passthrough: Bool = false, completion: @escaping (Bool, Error?) -> Void) {
         do {
             let metadataAsset = AVURLAsset(url: metadataURL)
             let templateIdentifier = metadataAsset.metadata(forFormat: .quickTimeMetadata).first(where: { item in
@@ -31,17 +36,30 @@ class Converter4Video: NSObject {
 
             loadTracks(asset: self.asset, type: .video) { videoTracks in
                 for track in videoTracks {
-                    let trackReaderOutput = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA as UInt32)])
+                    // nil output settings = hand back the compressed samples.
+                    let readerSettings: [String: Any]? = passthrough
+                        ? nil
+                        : [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA as UInt32)]
+                    let trackReaderOutput = AVAssetReaderTrackOutput(track: track, outputSettings: readerSettings)
                     if readerVideo.canAdd(trackReaderOutput) {
                         readerVideo.add(trackReaderOutput)
                     }
 
-                    let videoInput = AVAssetWriterInput(mediaType: .video,
+                    let videoInput: AVAssetWriterInput
+                    if passthrough, let format = track.formatDescriptions.first {
+                        videoInput = AVAssetWriterInput(mediaType: .video,
+                                                        outputSettings: nil,
+                                                        sourceFormatHint: (format as! CMFormatDescription))
+                    } else {
+                        videoInput = AVAssetWriterInput(mediaType: .video,
                                                         outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264,
                                                                          AVVideoWidthKey: track.naturalSize.width,
                                                                          AVVideoHeightKey: track.naturalSize.height])
+                    }
                     videoInput.transform = track.preferredTransform
-                    videoInput.expectsMediaDataInRealTime = true
+                    // Offline transcode — real-time mode can silently drop
+                    // frames on slower devices.
+                    videoInput.expectsMediaDataInRealTime = false
                     if writer.canAdd(videoInput) {
                         writer.add(videoInput)
                         videoIOs.append((videoInput, trackReaderOutput))
@@ -270,7 +288,10 @@ class Converter4Video: NSObject {
                 }
             }
 
-            compositionVideoTrack.scaleTimeRange(CMTimeRange(start: .zero, duration: composition.duration), toDuration: duration)
+            // Scale the WHOLE composition so every track is retimed together.
+            // Scaling only the video track leaves a longer audio track behind,
+            // and the export pads the difference with black frames.
+            composition.scaleTimeRange(CMTimeRange(start: .zero, duration: composition.duration), toDuration: duration)
             guard let exportSession = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
                 completion(false, NSError(domain: "VideoProcessing", code: -1, userInfo: nil))
                 return

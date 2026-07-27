@@ -42,23 +42,25 @@ class LivePhotoMaker {
     public class func generate(from imageURL: URL?,
                                videoURL: URL,
                                progress: @escaping (CGFloat) -> Void,
-                               completion: @escaping (PHLivePhoto?, LivePhotoResources?) -> Void) {
+                               completion: @escaping (PHLivePhoto?, LivePhotoResources?, String?) -> Void) {
         queue.async {
             shared.generate(from: imageURL, videoURL: videoURL, progress: progress, completion: completion)
         }
     }
 
-    public class func saveToLibrary(_ resources: LivePhotoResources, completion: @escaping (Bool) -> Void) {
+    public class func saveToLibrary(_ resources: LivePhotoResources, completion: @escaping (Bool, String?) -> Void) {
         PHPhotoLibrary.shared().performChanges({
             let creationRequest = PHAssetCreationRequest.forAsset()
             let options = PHAssetResourceCreationOptions()
             creationRequest.addResource(with: .pairedVideo, fileURL: resources.pairedVideo, options: options)
             creationRequest.addResource(with: .photo, fileURL: resources.pairedImage, options: options)
         }, completionHandler: { success, error in
-            if let error = error {
-                print("LivePhoto save error: \(error)")
-            }
-            completion(success)
+            // The library copies the resource data during the change
+            // block, so the staged pair is dead weight either way —
+            // without this the cache grew by a few MB per creation.
+            try? FileManager.default.removeItem(at: resources.pairedVideo)
+            try? FileManager.default.removeItem(at: resources.pairedImage)
+            completion(success, error?.localizedDescription)
         })
     }
 
@@ -67,18 +69,26 @@ class LivePhotoMaker {
     private func generate(from imageURL: URL?,
                           videoURL: URL,
                           progress: @escaping (CGFloat) -> Void,
-                          completion: @escaping (PHLivePhoto?, LivePhotoResources?) -> Void) {
+                          completion: @escaping (PHLivePhoto?, LivePhotoResources?, String?) -> Void) {
         guard let cacheDirectory = cacheDirectory, let metadataURL = metadataTemplateURL else {
-            DispatchQueue.main.async { completion(nil, nil) }
+            DispatchQueue.main.async { completion(nil, nil, "plugin cache directory or metadata template unavailable") }
             return
+        }
+
+        // Sweep leftovers from earlier runs (aborted pipelines, pairs
+        // staged before the post-save cleanup existed).
+        if let stale = try? FileManager.default.contentsOfDirectory(at: cacheDirectory, includingPropertiesForKeys: nil) {
+            for url in stale {
+                try? FileManager.default.removeItem(at: url)
+            }
         }
 
         DispatchQueue.main.async { progress(0.0) }
 
         let pipeline = Video2LivePhotoPipeline(metadataURL: metadataURL)
-        pipeline.process(videoURL: videoURL, cacheDirectory: cacheDirectory, customImageURL: imageURL) { output in
+        pipeline.process(videoURL: videoURL, cacheDirectory: cacheDirectory, customImageURL: imageURL) { output, errorMessage in
             guard let output = output else {
-                DispatchQueue.main.async { completion(nil, nil) }
+                DispatchQueue.main.async { completion(nil, nil, errorMessage ?? "Live Photo pipeline failed") }
                 return
             }
 
@@ -94,7 +104,7 @@ class LivePhotoMaker {
                 }
                 DispatchQueue.main.async {
                     progress(1.0)
-                    completion(livePhoto, resources)
+                    completion(livePhoto, resources, nil)
                 }
             }
         }

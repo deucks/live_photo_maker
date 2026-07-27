@@ -33,11 +33,11 @@ class MethodChannelLivePhotoMaker extends LivePhotoMakerPlatform {
       movPath = await methodChannel.invokeMethod("image_to_mov", [imagePath, width.toString(), height.toString()]);
     }
 
-    String result = await methodChannel.invokeMethod("create_live_photo", [coverImage, movPath]);
-    if (result == 'success') {
-      return true;
-    } else {
-      return false;
+    try {
+      String result = await methodChannel.invokeMethod("create_live_photo", [coverImage, movPath]);
+      return result == 'success';
+    } on PlatformException catch (e) {
+      throw LivePhotoException(e.message ?? 'Live Photo creation failed.');
     }
   }
 }
