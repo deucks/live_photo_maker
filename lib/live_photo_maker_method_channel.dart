@@ -49,4 +49,54 @@ class MethodChannelLivePhotoMaker extends LivePhotoMakerPlatform {
       throw LivePhotoException(e.message ?? 'Live Photo creation failed.');
     }
   }
+
+  @override
+  Future<String> renderClip({
+    required String sourcePath,
+    required String outputPath,
+    required double startSeconds,
+    required double windowSeconds,
+  }) async {
+    try {
+      final String path = await methodChannel.invokeMethod(
+        'render_clip',
+        <String, dynamic>{
+          'sourcePath': sourcePath,
+          'outputPath': outputPath,
+          'startSeconds': startSeconds,
+          'windowSeconds': windowSeconds,
+        },
+      );
+      return path;
+    } on PlatformException catch (e) {
+      throw LivePhotoException(e.message ?? 'Could not render the clip.');
+    }
+  }
+
+  @override
+  Future<MotionSample?> measureMotion({
+    required String sourcePath,
+    required double startSeconds,
+    required double windowSeconds,
+  }) async {
+    try {
+      final Map<dynamic, dynamic>? raw = await methodChannel.invokeMethod(
+        'measure_motion',
+        <String, dynamic>{
+          'sourcePath': sourcePath,
+          'startSeconds': startSeconds,
+          'windowSeconds': windowSeconds,
+        },
+      );
+      if (raw == null) return null;
+      return MotionSample(
+        meanYDiff: (raw['meanYDiff'] as num).toDouble(),
+        fps: (raw['fps'] as num).toDouble(),
+        frameCount: (raw['frameCount'] as num).toInt(),
+      );
+    } on PlatformException {
+      // Measurement is advisory; callers fall back to a default cap.
+      return null;
+    }
+  }
 }

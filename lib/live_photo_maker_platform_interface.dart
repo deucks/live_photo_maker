@@ -38,4 +38,43 @@ abstract class LivePhotoMakerPlatform extends PlatformInterface {
   }) {
     throw UnimplementedError('create() has not been implemented.');
   }
+
+  Future<String> renderClip({
+    required String sourcePath,
+    required String outputPath,
+    required double startSeconds,
+    required double windowSeconds,
+  }) {
+    throw UnimplementedError('renderClip() has not been implemented.');
+  }
+
+  Future<MotionSample?> measureMotion({
+    required String sourcePath,
+    required double startSeconds,
+    required double windowSeconds,
+  }) {
+    throw UnimplementedError('measureMotion() has not been implemented.');
+  }
+}
+
+/// Motion statistics for a source window, measured on a 160-wide decode
+/// so the numbers are comparable with ffmpeg's `signalstats` YDIF.
+class MotionSample {
+  const MotionSample({
+    required this.meanYDiff,
+    required this.fps,
+    required this.frameCount,
+  });
+
+  /// Mean absolute luma change between consecutive frames.
+  final double meanYDiff;
+
+  /// Frame rate measured from presentation timestamps.
+  final double fps;
+
+  final int frameCount;
+
+  /// Motion per second of source — the scale-invariant quantity a speed
+  /// budget should be divided by.
+  double get motionRate => meanYDiff * fps;
 }

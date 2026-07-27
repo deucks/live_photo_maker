@@ -29,6 +29,64 @@ public class SwiftLivePhotoPlugin: NSObject, FlutterPlugin {
              let sync = CXEImageToVideoSync(videoSettings: videoSettings)
              let fileURL = sync.createMovieFrom(url: imageURL, duration: 4)
              result(fileURL.absoluteString.replacingOccurrences(of: "file://", with: ""))
+      }else if method == "render_clip" {
+               guard let args = arguments as? [String: Any],
+                     let sourcePath = args["sourcePath"] as? String,
+                     let outputPath = args["outputPath"] as? String,
+                     let startSeconds = args["startSeconds"] as? Double,
+                     let windowSeconds = args["windowSeconds"] as? Double else {
+                   result(FlutterError(code: "render_clip_bad_arguments",
+                                       message: "render_clip expects sourcePath, outputPath, startSeconds and windowSeconds.",
+                                       details: nil))
+                   return
+               }
+               DispatchQueue.global(qos: .userInitiated).async {
+                   ContractClipRenderer().render(
+                       sourceURL: URL(fileURLWithPath: sourcePath),
+                       startSeconds: startSeconds,
+                       windowSeconds: windowSeconds,
+                       outputURL: URL(fileURLWithPath: outputPath)) { outcome in
+                       DispatchQueue.main.async {
+                           switch outcome {
+                           case .success(let url):
+                               result(url.path)
+                           case .failure(let error):
+                               result(FlutterError(code: "render_clip_failed",
+                                                   message: error.localizedDescription,
+                                                   details: nil))
+                           }
+                       }
+                   }
+               }
+      }else if method == "measure_motion" {
+               guard let args = arguments as? [String: Any],
+                     let sourcePath = args["sourcePath"] as? String,
+                     let startSeconds = args["startSeconds"] as? Double,
+                     let windowSeconds = args["windowSeconds"] as? Double else {
+                   result(FlutterError(code: "measure_motion_bad_arguments",
+                                       message: "measure_motion expects sourcePath, startSeconds and windowSeconds.",
+                                       details: nil))
+                   return
+               }
+               DispatchQueue.global(qos: .userInitiated).async {
+                   let sample = ContractClipRenderer().measureMotion(
+                       sourceURL: URL(fileURLWithPath: sourcePath),
+                       startSeconds: startSeconds,
+                       windowSeconds: windowSeconds)
+                   DispatchQueue.main.async {
+                       // nil means the measurement could not be taken;
+                       // the caller falls back to its default cap.
+                       guard let sample = sample else {
+                           result(nil)
+                           return
+                       }
+                       result([
+                           "meanYDiff": sample.meanYDiff,
+                           "fps": sample.fps,
+                           "frameCount": sample.frameCount,
+                       ])
+                   }
+               }
       }else if method == "create_live_photo" {
                guard let args = arguments as? [String: Any],
                      let videoPath = args["videoPath"] as? String else {

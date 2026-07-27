@@ -1,6 +1,7 @@
 import 'live_photo_maker_platform_interface.dart';
 
-export 'live_photo_maker_platform_interface.dart' show LivePhotoException;
+export 'live_photo_maker_platform_interface.dart'
+    show LivePhotoException, MotionSample;
 
 class LivePhotoMaker {
   /// [coverImage] Still shown when the Live Photo isn't animating. Omit it
@@ -27,6 +28,41 @@ class LivePhotoMaker {
       width: width,
       height: height,
       startSeconds: startSeconds,
+    );
+  }
+
+  /// Renders the Live Photo paired clip in one pass: takes
+  /// [windowSeconds] of source from [startSeconds] and retimes it onto
+  /// the ~0.92s paired duration at 1080x1920/60fps, bt709.
+  ///
+  /// The output matches the contract [create] looks for, so passing it
+  /// straight to [create] copies it through without re-encoding.
+  static Future<String> renderClip({
+    required String sourcePath,
+    required String outputPath,
+    required double startSeconds,
+    required double windowSeconds,
+  }) {
+    return LivePhotoMakerPlatform.instance.renderClip(
+      sourcePath: sourcePath,
+      outputPath: outputPath,
+      startSeconds: startSeconds,
+      windowSeconds: windowSeconds,
+    );
+  }
+
+  /// Measures motion across a source window, or null if it could not be
+  /// measured. Used to decide how fast a clip can safely play before
+  /// iOS's wallpaper motion check rejects it.
+  static Future<MotionSample?> measureMotion({
+    required String sourcePath,
+    required double startSeconds,
+    required double windowSeconds,
+  }) {
+    return LivePhotoMakerPlatform.instance.measureMotion(
+      sourcePath: sourcePath,
+      startSeconds: startSeconds,
+      windowSeconds: windowSeconds,
     );
   }
 }
